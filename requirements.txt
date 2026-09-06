@@ -1,0 +1,10 @@
+aiogram>=3.22,<4
+telethon>=1.42,<2
+openai>=1.107,<2
+aiosqlite>=0.21,<1
+apscheduler>=3.11,<4
+python-dotenv>=1.1,<2
+pypdf>=6,<7
+Pillow>=11,<12
+qrcode[pil]>=8.2,<9
+cryptography>=45,<46
