@@ -123,7 +123,8 @@ async def ensure_user(uid):
 async def role(uid):
     await ensure_user(uid)
     async with db() as c:
-        r = await c.execute_fetchone("SELECT role FROM users WHERE tg_id=? AND blocked=0", (uid,))
+        cur = await c.execute("SELECT role FROM users WHERE tg_id=? AND blocked=0", (uid,))
+        r = await cur.fetchone()
         return r[0] if r else "blocked"
 
 async def log_action(actor, action, status="ok", details=""):
@@ -225,7 +226,8 @@ async def menus(q: CallbackQuery):
 
 async def account_panel(uid):
     async with db() as c:
-        a=await c.execute_fetchone("SELECT tg_id,name,username,connected FROM ai_accounts WHERE owner_id=?", (uid,))
+        cur=await c.execute("SELECT tg_id,name,username,connected FROM ai_accounts WHERE owner_id=?", (uid,))
+        a=await cur.fetchone()
     text="🔗 AKUN AI\n\n"
     if a:
         text += f"Status: {'🟢 Connected' if a[3] else '🔴 Disconnected'}\nID: {a[0]}\nNama: {a[1] or '-'}\nUsername: @{a[2] if a[2] else '-'}"
@@ -286,7 +288,8 @@ async def qr_login(owner_id):
 
 async def attach_client(owner_id):
     async with db() as c:
-        a=await c.execute_fetchone("SELECT session_enc FROM ai_accounts WHERE owner_id=? AND connected=1",(owner_id,))
+        cur=await c.execute("SELECT session_enc FROM ai_accounts WHERE owner_id=? AND connected=1",(owner_id,))
+        a=await cur.fetchone()
     if not a: return
     try:
         session=decrypt_blob(a[0])
@@ -316,8 +319,10 @@ async def attach_client(owner_id):
 
 async def handle_ai_message(owner_id, ev, text):
     async with db() as c:
-        mem=(await c.execute_fetchone("SELECT text FROM memory WHERE owner_id=?",(owner_id,)))[0]
-        settings=await c.execute_fetchone("SELECT personality,mode,memory_on,tools_on FROM settings WHERE owner_id=?",(owner_id,))
+        cur=await c.execute("SELECT text FROM memory WHERE owner_id=?",(owner_id,))
+        mem=(await cur.fetchone())[0]
+        cur=await c.execute("SELECT personality,mode,memory_on,tools_on FROM settings WHERE owner_id=?",(owner_id,))
+        settings=await cur.fetchone()
     system=f"You are COWOK AI, a Telegram AI assistant. Be helpful, concise and honest. Personality={settings[0]}; mode={settings[1]}. Clearly identify yourself as an AI when relevant. Do not impersonate a real person or organization."
     if settings[2]: system += f"\nLong-term memory supplied by owner: {mem[:6000]}"
     try:
@@ -361,7 +366,8 @@ async def image_cmd(m: Message):
 async def disconnect(q: CallbackQuery):
     uid=q.from_user.id
     async with db() as c:
-        a=await c.execute_fetchone("SELECT tg_id FROM ai_accounts WHERE owner_id=?",(uid,))
+        cur=await c.execute("SELECT tg_id FROM ai_accounts WHERE owner_id=?",(uid,))
+        a=await cur.fetchone()
         await c.execute("DELETE FROM ai_accounts WHERE owner_id=?",(uid,))
         await c.commit()
     cl=clients.pop(uid,None)
@@ -423,9 +429,12 @@ async def settings_cb(q: CallbackQuery):
 async def stats(q: CallbackQuery):
     if await role(q.from_user.id) not in ("owner","admin"): return
     async with db() as c:
-        users=(await c.execute_fetchone("SELECT COUNT(*) FROM users"))[0]
-        accounts=(await c.execute_fetchone("SELECT COUNT(*) FROM ai_accounts WHERE connected=1"))[0]
-        logs=(await c.execute_fetchone("SELECT COUNT(*) FROM logs"))[0]
+        cur=await c.execute("SELECT COUNT(*) FROM users")
+        users=(await cur.fetchone())[0]
+        cur=await c.execute("SELECT COUNT(*) FROM ai_accounts WHERE connected=1")
+        accounts=(await cur.fetchone())[0]
+        cur=await c.execute("SELECT COUNT(*) FROM logs")
+        logs=(await cur.fetchone())[0]
     await q.answer()
     await q.message.answer(f"📊 Dashboard\n\nUsers: {users}\nConnected AI: {accounts}\nActivity logs: {logs}",
                             reply_markup=kb([[("🔙 Kembali","back:main")]]))
@@ -434,7 +443,8 @@ async def stats(q: CallbackQuery):
 async def users(q: CallbackQuery):
     if await role(q.from_user.id) not in ("owner","admin"): return
     async with db() as c:
-        rows=await c.execute_fetchall("SELECT tg_id,role,blocked FROM users ORDER BY created_at DESC LIMIT 30")
+        cur=await c.execute("SELECT tg_id,role,blocked FROM users ORDER BY created_at DESC LIMIT 30")
+        rows=await cur.fetchall()
     text="👥 USERS\n\n"+"\n".join(f"{x[0]} — {x[1]} — {'blocked' if x[2] else 'active'}" for x in rows)
     await q.answer(); await q.message.answer(text,reply_markup=kb([[("🔙 Kembali","back:main")]]))
 
@@ -442,7 +452,8 @@ async def users(q: CallbackQuery):
 async def logs_cb(q: CallbackQuery):
     if await role(q.from_user.id) not in ("owner","admin"): return
     async with db() as c:
-        rows=await c.execute_fetchall("SELECT actor_id,action,status,created_at FROM logs ORDER BY id DESC LIMIT 30")
+        cur=await c.execute("SELECT actor_id,action,status,created_at FROM logs ORDER BY id DESC LIMIT 30")
+        rows=await cur.fetchall()
     text="📋 LOGS\n\n"+"\n".join(f"{r[3]} | {r[0]} | {r[1]} | {r[2]}" for r in rows)
     await q.answer(); await q.message.answer(text,reply_markup=kb([[("🔙 Kembali","back:main")]]))
 
@@ -500,7 +511,8 @@ async def document(m: Message):
 async def startup():
     await init_db()
     async with db() as c:
-        rows=await c.execute_fetchall("SELECT owner_id FROM ai_accounts WHERE connected=1")
+        cur=await c.execute("SELECT owner_id FROM ai_accounts WHERE connected=1")
+        rows=await cur.fetchall()
     for (uid,) in rows:
         await attach_client(uid)
     scheduler.start()
