@@ -73,11 +73,14 @@ def decrypt_blob(token: str) -> str:
     raw = base64.urlsafe_b64decode(token)
     return AESGCM(KEY).decrypt(raw[:12], raw[12:], None).decode()
 
-async def db():
-    return await aiosqlite.connect(DB_PATH)
+def db():
+    # Return the aiosqlite connection context manager directly.
+    # Do not await connect() here and then use async-with: that starts the
+    # same worker thread twice on recent aiosqlite versions.
+    return aiosqlite.connect(DB_PATH)
 
 async def init_db():
-    async with await db() as c:
+    async with db() as c:
         await c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
           tg_id INTEGER PRIMARY KEY, role TEXT NOT NULL DEFAULT 'user',
@@ -110,7 +113,7 @@ async def init_db():
         await c.commit()
 
 async def ensure_user(uid):
-    async with await db() as c:
+    async with db() as c:
         await c.execute("INSERT OR IGNORE INTO users(tg_id,role,created_at) VALUES(?,?,?)",
                         (uid, "user", utcnow()))
         await c.execute("INSERT OR IGNORE INTO memory(owner_id,text) VALUES(?,?)", (uid, ""))
@@ -119,12 +122,12 @@ async def ensure_user(uid):
 
 async def role(uid):
     await ensure_user(uid)
-    async with await db() as c:
+    async with db() as c:
         r = await c.execute_fetchone("SELECT role FROM users WHERE tg_id=? AND blocked=0", (uid,))
         return r[0] if r else "blocked"
 
 async def log_action(actor, action, status="ok", details=""):
-    async with await db() as c:
+    async with db() as c:
         await c.execute("INSERT INTO logs(actor_id,action,status,details,created_at) VALUES(?,?,?,?,?)",
                         (actor, action, status, details[:1000], utcnow()))
         await c.commit()
@@ -221,7 +224,7 @@ async def menus(q: CallbackQuery):
         await send_panel(uid,"📜 TERMS & CONDITIONS\n\nCOWOK AI adalah perangkat lunak AI yang bekerja dengan akun Telegram yang diotorisasi pemiliknya. Jangan gunakan untuk spam, penipuan, impersonasi, akses tanpa izin, atau aktivitas ilegal. Pemilik akun bertanggung jawab atas tindakan yang dilakukan melalui akun tersebut. Fitur dibatasi oleh API dan permission Telegram. Session dan secret harus dijaga aman.\n\n🔙 Kembali",uid,back)
 
 async def account_panel(uid):
-    async with await db() as c:
+    async with db() as c:
         a=await c.execute_fetchone("SELECT tg_id,name,username,connected FROM ai_accounts WHERE owner_id=?", (uid,))
     text="🔗 AKUN AI\n\n"
     if a:
@@ -263,7 +266,7 @@ async def qr_login(owner_id):
             return
         me=await client.get_me()
         session=client.session.save()
-        async with await db() as c:
+        async with db() as c:
             await c.execute("DELETE FROM ai_accounts WHERE owner_id=?", (owner_id,))
             await c.execute("""INSERT INTO ai_accounts(owner_id,tg_id,name,username,session_enc,connected,created_at,last_active)
                                VALUES(?,?,?,?,?,?,?,?)""",
@@ -282,7 +285,7 @@ async def qr_login(owner_id):
         except: pass
 
 async def attach_client(owner_id):
-    async with await db() as c:
+    async with db() as c:
         a=await c.execute_fetchone("SELECT session_enc FROM ai_accounts WHERE owner_id=? AND connected=1",(owner_id,))
     if not a: return
     try:
@@ -312,7 +315,7 @@ async def attach_client(owner_id):
         await log_action(owner_id,"account_attach","error",str(e))
 
 async def handle_ai_message(owner_id, ev, text):
-    async with await db() as c:
+    async with db() as c:
         mem=(await c.execute_fetchone("SELECT text FROM memory WHERE owner_id=?",(owner_id,)))[0]
         settings=await c.execute_fetchone("SELECT personality,mode,memory_on,tools_on FROM settings WHERE owner_id=?",(owner_id,))
     system=f"You are COWOK AI, a Telegram AI assistant. Be helpful, concise and honest. Personality={settings[0]}; mode={settings[1]}. Clearly identify yourself as an AI when relevant. Do not impersonate a real person or organization."
@@ -328,7 +331,7 @@ async def handle_ai_message(owner_id, ev, text):
         if len(answer)>4000:
             answer=answer[:3990]+"…"
         await ev.reply(answer)
-        async with await db() as c:
+        async with db() as c:
             await c.execute("UPDATE ai_accounts SET last_active=? WHERE owner_id=?",(utcnow(),owner_id))
             await c.commit()
         await log_action(owner_id,"ai_reply","ok",answer[:200])
@@ -357,7 +360,7 @@ async def image_cmd(m: Message):
 @dp.callback_query(F.data=="account:disconnect")
 async def disconnect(q: CallbackQuery):
     uid=q.from_user.id
-    async with await db() as c:
+    async with db() as c:
         a=await c.execute_fetchone("SELECT tg_id FROM ai_accounts WHERE owner_id=?",(uid,))
         await c.execute("DELETE FROM ai_accounts WHERE owner_id=?",(uid,))
         await c.commit()
@@ -385,40 +388,41 @@ async def back(q: CallbackQuery):
 async def settings_cb(q: CallbackQuery):
     uid=q.from_user.id; action=q.data.split(":")[1]
     if action=="personality":
-        async with await db() as c:
+        async with db() as c:
             await c.execute("UPDATE settings SET personality=CASE WHEN personality='helpful' THEN 'professional' ELSE 'helpful' END WHERE owner_id=?",(uid,))
             await c.commit()
         await q.answer("Personality diganti.")
     elif action=="mode":
-        async with await db() as c:
+        async with db() as c:
             await c.execute("UPDATE settings SET mode=CASE WHEN mode='smart' THEN 'fast' ELSE 'smart' END WHERE owner_id=?",(uid,))
             await c.commit()
         await q.answer("AI mode diganti.")
     elif action=="memory":
-        async with await db() as c:
+        async with db() as c:
             await c.execute("UPDATE settings SET memory_on=1-memory_on WHERE owner_id=?",(uid,))
             await c.commit()
         await q.answer("Memory diubah.")
     elif action=="tools":
-        async with await db() as c:
+        async with db() as c:
             await c.execute("UPDATE settings SET tools_on=1-tools_on WHERE owner_id=?",(uid,))
             await c.commit()
         await q.answer("Tools diubah.")
     elif action=="mention":
-        async with await db() as c:
+        async with db() as c:
             await c.execute("UPDATE settings SET mentions_on=1-mentions_on WHERE owner_id=?",(uid,))
             await c.commit()
         await q.answer("Mention diubah.")
-    await menus(await FakeCallback(uid,"menu:ai"))
-
-class FakeCallback:
-    def __init__(self,uid,data): self.from_user=type("U",(),{"id":uid})(); self.data=data; self.message=None
-    async def answer(self,*a,**k): pass
+    # Refresh the AI settings panel directly instead of constructing a fake
+    # CallbackQuery object (which has no message and can fail on aiogram 3).
+    await send_panel(uid, "🤖 AI ASSISTANT\n\nAI berjalan melalui akun Telegram yang terhubung.\n\nPilih pengaturan:", uid,
+                     kb([[('🧠 Personality','set:personality'),('🎯 AI Mode','set:mode')],
+                         [('💾 Memory','set:memory'),('🛠️ Tools','set:tools')],
+                         [('🔔 Mention','set:mention')],[('🔙 Kembali','back:main')]]))
 
 @dp.callback_query(F.data=="admin:stats")
 async def stats(q: CallbackQuery):
     if await role(q.from_user.id) not in ("owner","admin"): return
-    async with await db() as c:
+    async with db() as c:
         users=(await c.execute_fetchone("SELECT COUNT(*) FROM users"))[0]
         accounts=(await c.execute_fetchone("SELECT COUNT(*) FROM ai_accounts WHERE connected=1"))[0]
         logs=(await c.execute_fetchone("SELECT COUNT(*) FROM logs"))[0]
@@ -429,7 +433,7 @@ async def stats(q: CallbackQuery):
 @dp.callback_query(F.data=="admin:users")
 async def users(q: CallbackQuery):
     if await role(q.from_user.id) not in ("owner","admin"): return
-    async with await db() as c:
+    async with db() as c:
         rows=await c.execute_fetchall("SELECT tg_id,role,blocked FROM users ORDER BY created_at DESC LIMIT 30")
     text="👥 USERS\n\n"+"\n".join(f"{x[0]} — {x[1]} — {'blocked' if x[2] else 'active'}" for x in rows)
     await q.answer(); await q.message.answer(text,reply_markup=kb([[("🔙 Kembali","back:main")]]))
@@ -437,7 +441,7 @@ async def users(q: CallbackQuery):
 @dp.callback_query(F.data=="admin:logs")
 async def logs_cb(q: CallbackQuery):
     if await role(q.from_user.id) not in ("owner","admin"): return
-    async with await db() as c:
+    async with db() as c:
         rows=await c.execute_fetchall("SELECT actor_id,action,status,created_at FROM logs ORDER BY id DESC LIMIT 30")
     text="📋 LOGS\n\n"+"\n".join(f"{r[3]} | {r[0]} | {r[1]} | {r[2]}" for r in rows)
     await q.answer(); await q.message.answer(text,reply_markup=kb([[("🔙 Kembali","back:main")]]))
@@ -495,7 +499,7 @@ async def document(m: Message):
 
 async def startup():
     await init_db()
-    async with await db() as c:
+    async with db() as c:
         rows=await c.execute_fetchall("SELECT owner_id FROM ai_accounts WHERE connected=1")
     for (uid,) in rows:
         await attach_client(uid)
