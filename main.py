@@ -37,6 +37,7 @@ oa = AsyncOpenAI(api_key=OPENAI_API_KEY)
 scheduler = AsyncIOScheduler(timezone="UTC")
 clients = {}
 qr_tasks = {}
+awaiting_poster = set()
 STOP_ALL = False
 
 def utcnow():
@@ -115,7 +116,12 @@ async def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, owner_id INTEGER, chat_id INTEGER,
           prompt TEXT, run_at TEXT, done INTEGER DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS branding(
+          owner_id INTEGER PRIMARY KEY, poster_file_id TEXT NOT NULL DEFAULT '', updated_at TEXT
+        );
         """)
+        await c.execute("INSERT OR IGNORE INTO branding(owner_id,poster_file_id,updated_at) VALUES(?,?,?)",
+                        (OWNER_ID, POSTER_FILE_ID, utcnow()))
         await c.execute("INSERT OR IGNORE INTO users(tg_id,role,created_at) VALUES(?,?,?)",
                         (OWNER_ID, "owner", utcnow()))
         await c.commit()
@@ -153,9 +159,22 @@ async def mandatory_join_ok(uid):
             return False
     return True
 
+def button_style(text: str, callback_data: str) -> str:
+    """Choose Telegram's native button style by action type."""
+    danger_words = ("hapus", "putus", "delete", "stop", "blokir", "hapus", "disconnect", "keluar")
+    success_words = ("hubung", "connect", "simpan", "aktif", "resume", "konfirmasi", "verifikasi", "join", "cek", "oke", "mengerti")
+    low = f"{text} {callback_data}".lower()
+    if any(w in low for w in danger_words):
+        return "danger"
+    if any(w in low for w in success_words):
+        return "success"
+    return "primary"
+
+
 def kb(rows):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=d) for t,d in row] for row in rows
+        [InlineKeyboardButton(text=t, callback_data=d, style=button_style(t, d)) for t,d in row]
+        for row in rows
     ])
 
 async def gate(uid):
@@ -178,11 +197,31 @@ def main_kb(uid, r):
     rows.append([("📜 TERMS & CONDITIONS","menu:terms")])
     return kb(rows)
 
+async def get_active_poster():
+    # Branding is global and managed by the Owner from the bot panel.
+    # If the database has no branding row, fall back to POSTER_FILE_ID.
+    async with db() as c:
+        row = await db_fetchone(c, "SELECT poster_file_id FROM branding WHERE owner_id=?", (OWNER_ID,))
+    return (row[0] if row else POSTER_FILE_ID) or ""
+
+async def set_active_poster(file_id: str):
+    async with db() as c:
+        await c.execute("INSERT INTO branding(owner_id,poster_file_id,updated_at) VALUES(?,?,?) ON CONFLICT(owner_id) DO UPDATE SET poster_file_id=excluded.poster_file_id, updated_at=excluded.updated_at",
+                        (OWNER_ID, file_id, utcnow()))
+        await c.commit()
+
+async def clear_active_poster():
+    async with db() as c:
+        await c.execute("INSERT INTO branding(owner_id,poster_file_id,updated_at) VALUES(?,?,?) ON CONFLICT(owner_id) DO UPDATE SET poster_file_id=excluded.poster_file_id, updated_at=excluded.updated_at",
+                        (OWNER_ID, "", utcnow()))
+        await c.commit()
+
 async def send_panel(chat_id, text, uid=None, keyboard=None):
     uid = uid or chat_id
-    if POSTER_FILE_ID:
+    poster = await get_active_poster()
+    if poster:
         try:
-            await bot.send_photo(chat_id, POSTER_FILE_ID, caption=text, reply_markup=keyboard)
+            await bot.send_photo(chat_id, poster, caption=text, reply_markup=keyboard)
             return
         except Exception:
             pass
@@ -460,6 +499,75 @@ async def join_cb(q: CallbackQuery):
     await q.answer()
     await q.message.answer("📢 Mandatory Join\n\nTarget IDs saat ini:\n"+("\n".join(map(str,REQUIRED_CHAT_IDS)) if REQUIRED_CHAT_IDS else "Tidak ada"),
                             reply_markup=kb([[("🔙 Kembali","back:main")]]))
+
+@dp.callback_query(F.data=="admin:poster")
+async def poster_admin(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner":
+        return
+    poster=await get_active_poster()
+    await q.answer()
+    status="🟢 Aktif" if poster else "🔴 Belum ada poster"
+    await q.message.answer(
+        f"🎨 POSTER & BRANDING\n\nStatus poster: {status}\n\n"
+        "Poster ini digunakan sebagai poster utama pada panel COWOK AI.\n"
+        "Pengaturan hanya dapat dilakukan oleh Owner.",
+        reply_markup=kb([[('🖼️ Set Poster','poster:set')],
+                         [('👁️ Lihat Poster','poster:view'),('🔄 Ganti Poster','poster:set')],
+                         [('🗑️ Hapus Poster','poster:delete')],
+                         [('🔙 Kembali','back:main')]])
+    )
+
+@dp.callback_query(F.data=="poster:set")
+async def poster_set_start(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner":
+        return
+    awaiting_poster.add(uid)
+    await q.answer()
+    await q.message.answer(
+        "🖼️ KIRIM POSTER\n\n"
+        "Silakan kirim 1 foto yang ingin dijadikan poster COWOK AI.\n"
+        "Setelah foto diterima, poster akan langsung menjadi poster aktif.\n\n"
+        "🔙 Untuk membatalkan, tekan Kembali.",
+        reply_markup=kb([[('🔙 Kembali','back:main')]])
+    )
+
+@dp.callback_query(F.data=="poster:view")
+async def poster_view(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner":
+        return
+    poster=await get_active_poster()
+    await q.answer()
+    if not poster:
+        await q.message.answer("🖼️ Belum ada poster yang disetel.", reply_markup=kb([[('🔙 Kembali','back:main')]]))
+        return
+    try:
+        await bot.send_photo(uid, poster, caption="🎨 POSTER AKTIF", reply_markup=kb([[('🔙 Kembali','back:main')]]))
+    except Exception:
+        await q.message.answer("❌ Poster tidak dapat ditampilkan. Silakan set poster baru.", reply_markup=kb([[('🔙 Kembali','back:main')]]))
+
+@dp.callback_query(F.data=="poster:delete")
+async def poster_delete(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner":
+        return
+    await clear_active_poster()
+    await q.answer("Poster dihapus.")
+    await log_action(uid,"poster_delete","ok")
+    await q.message.answer("🗑️ Poster berhasil dihapus.\n\nBot kembali menggunakan tampilan teks tanpa poster.", reply_markup=kb([[('🔙 Kembali','back:main')]]))
+
+@dp.message(F.photo)
+async def poster_photo(m: Message):
+    uid=m.from_user.id
+    if uid != OWNER_ID or uid not in awaiting_poster:
+        return
+    awaiting_poster.discard(uid)
+    file_id=m.photo[-1].file_id
+    await set_active_poster(file_id)
+    await log_action(uid,"poster_set","ok",file_id)
+    await m.answer_photo(file_id, caption="✅ POSTER AKTIF\n\nPoster COWOK AI berhasil disimpan dan akan digunakan pada panel bot berikutnya.", reply_markup=kb([[('🎨 Poster / Branding','admin:poster')],[('🔙 Kembali','back:main')]]))
 
 @dp.callback_query(F.data=="admin:stop")
 async def stop_cb(q: CallbackQuery):
