@@ -1,4 +1,4 @@
-aiogram>=3.22,<4
+aiogram>=3.25,<4
 telethon>=1.42,<2
 openai>=1.107,<2
 aiosqlite>=0.21,<1

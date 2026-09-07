@@ -43,3 +43,9 @@ Important:
 - Telegram permissions/API limits still apply.
 - Do not commit .env or session material.
 - Keep the service on a persistent Railway volume if you want local SQLite/session files to survive redeploys; otherwise use PostgreSQL/object storage for production scale.
+
+
+## Fitur tambahan
+- Bot `@Cowokbot` sendiri dapat menjawab percakapan AI di private chat; akun Telegram yang terhubung tetap menjadi identitas AI untuk percakapan melalui user account.
+- Tombol `👨‍💼 KONTAK ADMIN` tersedia di menu utama. URL dapat diatur lewat `ADMIN_CONTACT_URL`; jika kosong, bot memakai profil Owner.
+- Mandatory Join memblokir akses sampai user lolos verifikasi ke semua target aktif.
