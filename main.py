@@ -25,7 +25,8 @@ API_HASH = os.environ["API_HASH"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", f"tg://user?id={OWNER_ID}")
-AI_MODEL = os.getenv("AI_MODEL", "gpt-5.4")
+AI_MODEL = os.getenv("AI_MODEL", "gpt-5")
+AI_FALLBACK_MODELS = [x.strip() for x in os.getenv("AI_FALLBACK_MODELS", "gpt-5-mini,gpt-4.1-mini").split(",") if x.strip()]
 POSTER_FILE_ID = os.getenv("POSTER_FILE_ID", "")
 REQUIRED_CHAT_IDS = [int(x.strip()) for x in os.getenv("REQUIRED_CHAT_IDS", "").split(",") if x.strip()]
 DATA_DIR = Path("data")
@@ -179,18 +180,16 @@ async def send_join_gate(uid):
     rows = []
     for _, cid, title, invite_url, _ in targets:
         if invite_url:
-            rows.append([(f"📢 {title or cid}", invite_url)])
-    rows.append([("🔄 ✅ Saya Sudah Join", "join:check")])
-    rows.append([("🔙 Kembali", "back:main")])
+            rows.append([InlineKeyboardButton(text=f"📢 {title or cid}", url=invite_url)])
+    rows.append([InlineKeyboardButton(text="🟢 Saya Sudah Join", callback_data="join:check", style="success")])
+    rows.append([InlineKeyboardButton(text="🔙 Kembali", callback_data="back:main", style="primary")])
     await bot.send_message(uid,
         "🔒 AKSES TERKUNCI\n\n"
         "Kamu harus bergabung ke semua grup/channel wajib sebelum dapat menggunakan COWOK AI.\n\n"
         "1. Tekan tombol grup/channel di bawah.\n"
         "2. Join semuanya.\n"
         "3. Tekan ‘Saya Sudah Join’ untuk verifikasi.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=t, url=d) for t,d in row] for row in rows
-        ]))
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
 
 def button_style(text: str, callback_data: str) -> str:
     """Choose Telegram's native button style by action type."""
@@ -205,14 +204,70 @@ def button_style(text: str, callback_data: str) -> str:
 
 
 def kb(rows):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=t, callback_data=d, style=button_style(t, d)) for t,d in row]
-        for row in rows
-    ])
+    buttons=[]
+    for row in rows:
+        out=[]
+        for t,d in row:
+            if isinstance(d, str) and (d.startswith("https://") or d.startswith("http://") or d.startswith("tg://")):
+                out.append(InlineKeyboardButton(text=t, url=d, style="primary"))
+            else:
+                out.append(InlineKeyboardButton(text=t, callback_data=d, style=button_style(t, d)))
+        buttons.append(out)
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def ai_response(*, instructions, input_text, use_web=False):
+    """Call the Responses API robustly, with a safe no-tool retry and model fallback.
+
+    This prevents a temporary web-tool/model compatibility issue from turning
+    every normal chat message into the generic AI error. The real exception is
+    returned to the caller so it can be logged and diagnosed.
+    """
+    models=[]
+    for model in [AI_MODEL, *AI_FALLBACK_MODELS]:
+        if model and model not in models:
+            models.append(model)
+    last_error=None
+    for model in models:
+        attempts=[]
+        if use_web:
+            attempts.append([{"type":"web_search"}])
+        attempts.append([])
+        for tools in attempts:
+            try:
+                response=await oa.responses.create(
+                    model=model,
+                    instructions=instructions,
+                    input=input_text,
+                    tools=tools,
+                )
+                answer=(response.output_text or "").strip()
+                if not answer:
+                    raise RuntimeError(f"OpenAI returned empty output (model={model})")
+                return answer, model, None
+            except Exception as e:
+                last_error=e
+                log.warning("AI request failed model=%s tools=%s: %s", model, bool(tools), e)
+    return None, None, last_error
+
+async def notify_owner_ai_error(context, exc):
+    details=f"{type(exc).__name__}: {exc}"
+    await log_action(OWNER_ID, context, "error", details)
+    try:
+        await bot.send_message(OWNER_ID, "⚠️ <b>COWOK AI — AI API ERROR</b>\n\n"
+            f"<b>Bagian:</b> {context}\n"
+            f"<b>Error:</b> <code>{details[:3000]}</code>\n\n"
+            "Periksa OPENAI_API_KEY, AI_MODEL, saldo/akses API, dan deployment Railway.", parse_mode="HTML")
+    except Exception:
+        log.exception("Failed to notify owner")
 
 async def gate(uid):
-    if await role(uid) == "blocked":
+    current_role = await role(uid)
+    if current_role == "blocked":
         return False
+    # Owner can always access the control panel, including while configuring
+    # Mandatory Join. Regular users must satisfy all enabled targets.
+    if current_role == "owner":
+        return True
     if not await mandatory_join_ok(uid):
         await send_join_gate(uid)
         return False
@@ -309,14 +364,25 @@ async def menus(q: CallbackQuery):
 async def contact_admin(q: CallbackQuery):
     uid=q.from_user.id
     if not await gate(uid):
+        await q.answer("🔒 Selesaikan Mandatory Join terlebih dahulu.", show_alert=True)
         return
+    username=None
+    try:
+        owner_chat=await bot.get_chat(OWNER_ID)
+        username=getattr(owner_chat, "username", None)
+    except Exception as e:
+        log.warning("Could not resolve owner username: %s", e)
+    contact_url=(f"https://t.me/{username}" if username else ADMIN_CONTACT_URL)
+    contact_line=(f"Admin: @{username}" if username else f"Admin ID: <code>{OWNER_ID}</code>")
     await q.answer()
     await q.message.answer(
         "👨‍💼 KONTAK ADMIN\n\n"
         "Butuh bantuan, laporan masalah, atau ingin menghubungi pengelola COWOK AI?\n\n"
+        f"{contact_line}\n\n"
         "Tekan tombol di bawah untuk membuka chat Admin.",
+        parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Chat Admin", url=ADMIN_CONTACT_URL, style="primary")],
+            [InlineKeyboardButton(text="💬 Chat Admin", url=contact_url, style="primary")],
             [InlineKeyboardButton(text="🔙 Kembali", callback_data="back:main", style="primary")]
         ])
     )
@@ -419,23 +485,21 @@ async def handle_ai_message(owner_id, ev, text):
     system=f"You are COWOK AI, a Telegram AI assistant. Be helpful, concise and honest. Personality={settings[0]}; mode={settings[1]}. Clearly identify yourself as an AI when relevant. Do not impersonate a real person or organization."
     if settings[2]: system += f"\nLong-term memory supplied by owner: {mem[:6000]}"
     try:
-        response=await oa.responses.create(
-            model=AI_MODEL,
-            instructions=system,
-            input=text,
-            tools=[{"type":"web_search"}] if settings[3] else []
+        answer, used_model, error = await ai_response(
+            instructions=system, input_text=text, use_web=bool(settings[3])
         )
-        answer=response.output_text or "Maaf, saya tidak mendapatkan jawaban."
+        if error or not answer:
+            raise error or RuntimeError("AI returned no answer")
         if len(answer)>4000:
             answer=answer[:3990]+"…"
         await ev.reply(answer)
         async with db() as c:
             await c.execute("UPDATE ai_accounts SET last_active=? WHERE owner_id=?",(utcnow(),owner_id))
             await c.commit()
-        await log_action(owner_id,"ai_reply","ok",answer[:200])
+        await log_action(owner_id,"ai_reply","ok",f"model={used_model}; {answer[:180]}")
     except Exception as e:
-        await ev.reply("Maaf, AI sedang mengalami kendala. Coba lagi sebentar.")
-        await log_action(owner_id,"ai_reply","error",str(e))
+        await ev.reply("Maaf, AI sedang mengalami kendala sementara. Coba lagi sebentar.")
+        await notify_owner_ai_error("ai_account_reply", e)
 
 @dp.message(F.text)
 async def bot_ai_chat(m: Message):
@@ -448,7 +512,45 @@ async def bot_ai_chat(m: Message):
     text=(m.text or "").strip()
     if not text or text.startswith("/"):
         return
-    if uid in awaiting_join or uid in awaiting_poster:
+
+    # Mandatory Join setup must be handled here because aiogram stops
+    # propagation after a matching F.text handler. This prevents the setup
+    # message from being silently swallowed by the general AI chat handler.
+    if uid in awaiting_join:
+        if uid != OWNER_ID:
+            awaiting_join.discard(uid)
+            return
+        raw=text
+        parts=[x.strip() for x in raw.split('|')]
+        if len(parts) != 3:
+            await m.answer("❌ Format salah. Gunakan: CHAT_ID | NAMA | LINK_JOIN", reply_markup=kb([[('🔙 Kembali','back:main')]]))
+            return
+        try:
+            cid=int(parts[0])
+        except ValueError:
+            await m.answer("❌ CHAT_ID harus berupa angka, misalnya -1001234567890.")
+            return
+        title,link=parts[1],parts[2]
+        if not re.match(r"^https?://t\.me/",link):
+            await m.answer("❌ LINK_JOIN harus berupa link Telegram, misalnya https://t.me/namagrup")
+            return
+        try:
+            chat=await bot.get_chat(cid)
+            title=title or (chat.title or str(cid))
+        except Exception as e:
+            await m.answer("❌ Bot tidak dapat mengakses chat tersebut. Pastikan CHAT_ID benar dan bot sudah masuk ke grup/channel.")
+            await log_action(uid,"mandatory_join_add","error",str(e))
+            return
+        async with db() as c:
+            await c.execute("INSERT INTO join_targets(chat_id,title,invite_url,enabled,created_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,invite_url=excluded.invite_url,enabled=1",
+                            (cid,title,link,1,utcnow()))
+            await c.commit()
+        awaiting_join.discard(uid)
+        await log_action(uid,"mandatory_join_add","ok",str(cid))
+        await m.answer(f"✅ Mandatory Join ditambahkan: {title}\n\nCHAT_ID: {cid}\nStatus: 🟢 Aktif", reply_markup=kb([[('📢 Mandatory Join','admin:join')],[('🔙 Kembali','back:main')]]))
+        return
+
+    if uid in awaiting_poster:
         return
     if not await gate(uid):
         return
@@ -475,24 +577,22 @@ async def bot_ai_chat(m: Message):
         system += f"\nRelevant long-term memory for this user: {mem[:6000]}"
     try:
         try:
-            await bot.send_chat_action(uid, "typing")
+            await bot.send_chat_action(m.chat.id, "typing")
         except Exception:
             pass
-        response=await oa.responses.create(
-            model=AI_MODEL,
-            instructions=system,
-            input=text,
-            tools=[{"type":"web_search"}] if tools_on else []
+        answer, used_model, error = await ai_response(
+            instructions=system, input_text=text, use_web=bool(tools_on)
         )
-        answer=response.output_text or "Maaf, saya belum mendapatkan jawaban."
+        if error or not answer:
+            raise error or RuntimeError("AI returned no answer")
         if len(answer)>4000:
             answer=answer[:3990]+"…"
         await m.answer(answer)
-        await log_action(uid,"bot_ai_reply","ok",answer[:200])
+        await log_action(uid,"bot_ai_reply","ok",f"model={used_model}; {answer[:180]}")
     except Exception as e:
         log.exception("bot AI chat")
-        await m.answer("❌ Maaf, AI sedang mengalami kendala. Coba lagi sebentar.")
-        await log_action(uid,"bot_ai_reply","error",str(e))
+        await m.answer("❌ AI sedang mengalami kendala sementara. Sistem sudah mencatat error untuk Admin. Silakan coba lagi sebentar.")
+        await notify_owner_ai_error("bot_ai_reply", e)
 
 @dp.message(Command("image"))
 async def image_cmd(m: Message):
@@ -509,8 +609,8 @@ async def image_cmd(m: Message):
         await m.answer_photo(BufferedInputFile(data,"cowok-ai.png"),caption="🖼️ COWOK AI")
         await log_action(uid,"image_generate","ok",prompt[:200])
     except Exception as e:
-        await m.answer("❌ Gagal membuat gambar.")
-        await log_action(uid,"image_generate","error",str(e))
+        await m.answer("❌ Gagal membuat gambar. Error sudah dicatat untuk Admin.")
+        await notify_owner_ai_error("image_generate", e)
 
 @dp.callback_query(F.data=="account:disconnect")
 async def disconnect(q: CallbackQuery):
@@ -698,40 +798,6 @@ async def join_check(q: CallbackQuery):
         await q.answer("❌ Kamu belum join semuanya.",show_alert=True)
         await send_join_gate(uid)
 
-@dp.message(F.text)
-async def join_text(m: Message):
-    uid=m.from_user.id
-    if uid not in awaiting_join or uid != OWNER_ID:
-        return
-    raw=(m.text or '').strip()
-    parts=[x.strip() for x in raw.split('|')]
-    if len(parts) != 3:
-        await m.answer("❌ Format salah. Gunakan: CHAT_ID | NAMA | LINK_JOIN",reply_markup=kb([[('🔙 Kembali','back:main')]]))
-        return
-    try:
-        cid=int(parts[0])
-    except ValueError:
-        await m.answer("❌ CHAT_ID harus berupa angka, misalnya -1001234567890.")
-        return
-    title,link=parts[1],parts[2]
-    if not re.match(r"^https?://t\.me/",link):
-        await m.answer("❌ LINK_JOIN harus berupa link Telegram, misalnya https://t.me/namagrup")
-        return
-    try:
-        chat=await bot.get_chat(cid)
-        title=title or (chat.title or str(cid))
-    except Exception as e:
-        await m.answer("❌ Bot tidak dapat mengakses chat tersebut. Pastikan CHAT_ID benar dan bot sudah masuk ke grup/channel.")
-        await log_action(uid,"mandatory_join_add","error",str(e))
-        return
-    async with db() as c:
-        await c.execute("INSERT INTO join_targets(chat_id,title,invite_url,enabled,created_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,invite_url=excluded.invite_url,enabled=1",
-                        (cid,title,link,1,utcnow()))
-        await c.commit()
-    awaiting_join.discard(uid)
-    await log_action(uid,"mandatory_join_add","ok",str(cid))
-    await m.answer(f"✅ Mandatory Join ditambahkan: {title}",reply_markup=kb([[('📢 Mandatory Join','admin:join')],[('🔙 Kembali','back:main')]]))
-
 @dp.callback_query(F.data=="admin:poster")
 async def poster_admin(q: CallbackQuery):
     uid=q.from_user.id
@@ -837,13 +903,17 @@ async def document(m: Message):
         return
     text=text[:30000]
     try:
-        r=await oa.responses.create(model=AI_MODEL,instructions="Analisis dokumen berikut dan jawab secara ringkas dalam bahasa Indonesia.",input=text)
-        ans=r.output_text or "Tidak ada hasil."
+        ans, used_model, error=await ai_response(
+            instructions="Analisis dokumen berikut dan jawab secara ringkas dalam bahasa Indonesia.",
+            input_text=text, use_web=False
+        )
+        if error or not ans:
+            raise error or RuntimeError("AI returned no answer")
         await m.answer(ans[:4000])
-        await log_action(uid,"document_analysis","ok",doc.file_name)
+        await log_action(uid,"document_analysis","ok",f"model={used_model}; {doc.file_name}")
     except Exception as e:
-        await m.answer("❌ Gagal menganalisis dokumen.")
-        await log_action(uid,"document_analysis","error",str(e))
+        await m.answer("❌ Gagal menganalisis dokumen. Error sudah dicatat untuk Admin.")
+        await notify_owner_ai_error("document_analysis", e)
 
 async def startup():
     await init_db()

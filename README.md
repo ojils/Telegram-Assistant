@@ -1,51 +1,46 @@
-# COWOK AI — Railway-ready foundation
+# COWOK AI
 
-This project implements the core architecture discussed:
-- Telegram bot as Control Panel
-- Telegram user account connection using QR login (no OTP/password is collected by the bot)
-- Encrypted-at-rest Telethon session blobs
-- Owner/Admin/User roles
-- Mandatory join checking
-- AI chat through connected user accounts
-- OpenAI Responses API with web search
-- Image generation command
-- PDF/text document extraction
-- Per-account memory
-- Scheduler
-- Activity logging
-- Emergency stop
-- Poster file_id support
-- Back/Kembali navigation
+Telegram AI Assistant untuk deployment Railway.
 
-## Railway variables
-Set:
-BOT_TOKEN, API_ID, API_HASH, OPENAI_API_KEY, OWNER_ID.
-Optional:
-REQUIRED_CHAT_IDS=-100123,-100456
-AI_MODEL=gpt-5.4
-POSTER_FILE_ID=<telegram file_id>
-SESSION_ENCRYPTION_KEY=<32-byte urlsafe base64 key>
+## Isi
+- Bot AI chat langsung di private chat dan mention di grup
+- OpenAI Responses API + web search dengan retry/fallback model
+- Image generation
+- Analisis PDF/TXT
+- Telegram user account via QR (Telethon)
+- Memory dan settings
+- Mandatory Join
+- Poster / Branding
+- Owner/Admin panel, logs, emergency stop
+- Contact Admin dengan username otomatis atau fallback Telegram ID
+- Tombol inline berwarna (primary/success/danger)
 
-Generate a key locally with:
-python -c "import secrets,base64; print(base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())"
+## Railway Variables
+Wajib:
+- `BOT_TOKEN`
+- `API_ID`
+- `API_HASH`
+- `OPENAI_API_KEY`
+- `OWNER_ID`
 
-API_ID/API_HASH come from Telegram's official API development tools. The QR flow lets the account owner authorize the user account directly in Telegram.
+Disarankan:
+- `AI_MODEL=gpt-5`
+- `AI_FALLBACK_MODELS=gpt-5-mini,gpt-4.1-mini`
+- `SESSION_ENCRYPTION_KEY` (32-byte base64/url-safe secret)
+- `ADMIN_CONTACT_URL` (opsional; default `tg://user?id=OWNER_ID`)
 
-## Run
-pip install -r requirements.txt
-python main.py
+Opsional:
+- `REQUIRED_CHAT_IDS`
+- `POSTER_FILE_ID`
 
-Railway start command:
-python main.py
+## Deploy
+Upload isi folder ini ke root repository GitHub agar `main.py` dan `Procfile` berada di root. Railway menjalankan:
 
-Important:
-- This is a production-oriented foundation, not a claim that every Telegram feature is universally available.
-- Telegram permissions/API limits still apply.
-- Do not commit .env or session material.
-- Keep the service on a persistent Railway volume if you want local SQLite/session files to survive redeploys; otherwise use PostgreSQL/object storage for production scale.
+`worker: python main.py`
 
+Setelah deploy, buka bot dan `/start`.
 
-## Fitur tambahan
-- Bot `@Cowokbot` sendiri dapat menjawab percakapan AI di private chat; akun Telegram yang terhubung tetap menjadi identitas AI untuk percakapan melalui user account.
-- Tombol `👨‍💼 KONTAK ADMIN` tersedia di menu utama. URL dapat diatur lewat `ADMIN_CONTACT_URL`; jika kosong, bot memakai profil Owner.
-- Mandatory Join memblokir akses sampai user lolos verifikasi ke semua target aktif.
+## Jika AI gagal
+Bot tidak lagi menelan error. Error API dicatat ke log dan Owner menerima notifikasi diagnostik. Periksa `OPENAI_API_KEY`, model yang dipilih, akses/billing API, dan log Railway.
+
+Jangan pernah mengirim API key, API hash, OTP, password 2FA, atau session Telegram ke orang lain.
