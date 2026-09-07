@@ -24,6 +24,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OWNER_ID = int(os.environ["OWNER_ID"])
+ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", f"tg://user?id={OWNER_ID}")
 AI_MODEL = os.getenv("AI_MODEL", "gpt-5.4")
 POSTER_FILE_ID = os.getenv("POSTER_FILE_ID", "")
 REQUIRED_CHAT_IDS = [int(x.strip()) for x in os.getenv("REQUIRED_CHAT_IDS", "").split(",") if x.strip()]
@@ -38,6 +39,7 @@ scheduler = AsyncIOScheduler(timezone="UTC")
 clients = {}
 qr_tasks = {}
 awaiting_poster = set()
+awaiting_join = set()
 STOP_ALL = False
 
 def utcnow():
@@ -119,6 +121,11 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS branding(
           owner_id INTEGER PRIMARY KEY, poster_file_id TEXT NOT NULL DEFAULT '', updated_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS join_targets(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL UNIQUE,
+          title TEXT NOT NULL DEFAULT '', invite_url TEXT NOT NULL DEFAULT '',
+          enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL
+        );
         """)
         await c.execute("INSERT OR IGNORE INTO branding(owner_id,poster_file_id,updated_at) VALUES(?,?,?)",
                         (OWNER_ID, POSTER_FILE_ID, utcnow()))
@@ -146,10 +153,18 @@ async def log_action(actor, action, status="ok", details=""):
                         (actor, action, status, details[:1000], utcnow()))
         await c.commit()
 
+async def get_join_targets():
+    async with db() as c:
+        rows = await db_fetchall(c, "SELECT id,chat_id,title,invite_url,enabled FROM join_targets ORDER BY id")
+    if rows:
+        return rows
+    return [(0, cid, str(cid), "", 1) for cid in REQUIRED_CHAT_IDS]
+
 async def mandatory_join_ok(uid):
-    if not REQUIRED_CHAT_IDS:
+    targets = [r for r in await get_join_targets() if r[4]]
+    if not targets:
         return True
-    for cid in REQUIRED_CHAT_IDS:
+    for _, cid, _, _, _ in targets:
         try:
             m = await bot.get_chat_member(cid, uid)
             if m.status in ("left", "kicked"):
@@ -158,6 +173,24 @@ async def mandatory_join_ok(uid):
             # If the bot cannot verify membership, fail closed.
             return False
     return True
+
+async def send_join_gate(uid):
+    targets = [r for r in await get_join_targets() if r[4]]
+    rows = []
+    for _, cid, title, invite_url, _ in targets:
+        if invite_url:
+            rows.append([(f"📢 {title or cid}", invite_url)])
+    rows.append([("🔄 ✅ Saya Sudah Join", "join:check")])
+    rows.append([("🔙 Kembali", "back:main")])
+    await bot.send_message(uid,
+        "🔒 AKSES TERKUNCI\n\n"
+        "Kamu harus bergabung ke semua grup/channel wajib sebelum dapat menggunakan COWOK AI.\n\n"
+        "1. Tekan tombol grup/channel di bawah.\n"
+        "2. Join semuanya.\n"
+        "3. Tekan ‘Saya Sudah Join’ untuk verifikasi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=t, url=d) for t,d in row] for row in rows
+        ]))
 
 def button_style(text: str, callback_data: str) -> str:
     """Choose Telegram's native button style by action type."""
@@ -181,7 +214,7 @@ async def gate(uid):
     if await role(uid) == "blocked":
         return False
     if not await mandatory_join_ok(uid):
-        await bot.send_message(uid, "📢 Silakan bergabung ke semua grup/channel wajib terlebih dahulu.")
+        await send_join_gate(uid)
         return False
     return True
 
@@ -191,6 +224,7 @@ def main_kb(uid, r):
         [("🖼️ IMAGE AI","menu:image"), ("🛠️ AI TOOLS","menu:tools")],
         [("👥 GROUP & CHANNEL","menu:telegram")],
         [("⚙️ SETTINGS","menu:settings")],
+        [("👨‍💼 KONTAK ADMIN","contact:admin")],
     ]
     if r in ("owner","admin"):
         rows.append([("👨‍💼 ADMIN","menu:admin")])
@@ -265,10 +299,27 @@ async def menus(q: CallbackQuery):
         await send_panel(uid,"👨‍💼 ADMIN PANEL",uid,
                          kb([[("📊 Dashboard","admin:stats"),("👥 Users","admin:users")],
                              [("📋 Logs","admin:logs"),("📢 Mandatory Join","admin:join")],
+                             [("🎨 Poster / Branding","admin:poster")],
                              [("🛑 Emergency Stop","admin:stop"),("▶️ Resume","admin:resume")],
                              [("🔙 Kembali","back:main")]]))
     elif key=="terms":
         await send_panel(uid,"📜 TERMS & CONDITIONS\n\nCOWOK AI adalah perangkat lunak AI yang bekerja dengan akun Telegram yang diotorisasi pemiliknya. Jangan gunakan untuk spam, penipuan, impersonasi, akses tanpa izin, atau aktivitas ilegal. Pemilik akun bertanggung jawab atas tindakan yang dilakukan melalui akun tersebut. Fitur dibatasi oleh API dan permission Telegram. Session dan secret harus dijaga aman.\n\n🔙 Kembali",uid,back)
+
+@dp.callback_query(F.data=="contact:admin")
+async def contact_admin(q: CallbackQuery):
+    uid=q.from_user.id
+    if not await gate(uid):
+        return
+    await q.answer()
+    await q.message.answer(
+        "👨‍💼 KONTAK ADMIN\n\n"
+        "Butuh bantuan, laporan masalah, atau ingin menghubungi pengelola COWOK AI?\n\n"
+        "Tekan tombol di bawah untuk membuka chat Admin.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Chat Admin", url=ADMIN_CONTACT_URL, style="primary")],
+            [InlineKeyboardButton(text="🔙 Kembali", callback_data="back:main", style="primary")]
+        ])
+    )
 
 async def account_panel(uid):
     async with db() as c:
@@ -386,6 +437,63 @@ async def handle_ai_message(owner_id, ev, text):
         await ev.reply("Maaf, AI sedang mengalami kendala. Coba lagi sebentar.")
         await log_action(owner_id,"ai_reply","error",str(e))
 
+@dp.message(F.text)
+async def bot_ai_chat(m: Message):
+    """Make the Bot account itself usable as a normal AI assistant.
+
+    Private chats get normal conversational AI. In groups, the bot responds
+    only when addressed with an AI/COWOK AI prefix, keeping group noise low.
+    """
+    uid=m.from_user.id
+    text=(m.text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    if uid in awaiting_join or uid in awaiting_poster:
+        return
+    if not await gate(uid):
+        return
+
+    # In groups, respond only when explicitly addressed.
+    if m.chat.type != "private":
+        low=text.lower()
+        if not low.startswith(("ai ", "ai,", "cowok ai", "@cowok", "@cowokbot")):
+            return
+
+    async with db() as c:
+        mem_row=await db_fetchone(c, "SELECT text FROM memory WHERE owner_id=?", (uid,))
+        settings=await db_fetchone(c, "SELECT personality,mode,memory_on,tools_on FROM settings WHERE owner_id=?", (uid,))
+    mem=(mem_row[0] if mem_row else "")
+    personality,mode,memory_on,tools_on=settings or ("helpful","smart",1,1)
+    system=(
+        "You are COWOK AI, the AI assistant operating directly through the Telegram bot. "
+        "You are not a human and must not claim to be one. Be helpful, natural, concise, "
+        "and honest. Answer in the user's language when practical. You can help with "
+        "conversation, explanations, writing, coding, planning, analysis, and other lawful tasks. "
+        f"Personality={personality}; mode={mode}."
+    )
+    if memory_on and mem:
+        system += f"\nRelevant long-term memory for this user: {mem[:6000]}"
+    try:
+        try:
+            await bot.send_chat_action(uid, "typing")
+        except Exception:
+            pass
+        response=await oa.responses.create(
+            model=AI_MODEL,
+            instructions=system,
+            input=text,
+            tools=[{"type":"web_search"}] if tools_on else []
+        )
+        answer=response.output_text or "Maaf, saya belum mendapatkan jawaban."
+        if len(answer)>4000:
+            answer=answer[:3990]+"…"
+        await m.answer(answer)
+        await log_action(uid,"bot_ai_reply","ok",answer[:200])
+    except Exception as e:
+        log.exception("bot AI chat")
+        await m.answer("❌ Maaf, AI sedang mengalami kendala. Coba lagi sebentar.")
+        await log_action(uid,"bot_ai_reply","error",str(e))
+
 @dp.message(Command("image"))
 async def image_cmd(m: Message):
     uid=m.from_user.id
@@ -495,10 +603,134 @@ async def logs_cb(q: CallbackQuery):
 
 @dp.callback_query(F.data=="admin:join")
 async def join_cb(q: CallbackQuery):
-    if await role(q.from_user.id) not in ("owner","admin"): return
+    uid=q.from_user.id
+    if await role(uid) not in ("owner","admin"): return
+    targets=await get_join_targets()
+    active=[r for r in targets if r[4]]
+    lines=[]
+    for i,r in enumerate(targets,1):
+        status="🟢 Aktif" if r[4] else "🔴 Nonaktif"
+        lines.append(f"{i}. {r[2] or r[1]} — {status}\n   ID: {r[1]}" + (f"\n   Link: {r[3]}" if r[3] else "\n   ⚠️ Belum ada link join"))
+    text=("📢 MANDATORY JOIN\n\n"
+          f"Status: {'🟢 Aktif' if active else '🔴 Belum dikonfigurasi'}\n"
+          f"Target: {len(active)}\n\n"
+          +("\n\n".join(lines) if lines else "Belum ada grup/channel wajib."))
     await q.answer()
-    await q.message.answer("📢 Mandatory Join\n\nTarget IDs saat ini:\n"+("\n".join(map(str,REQUIRED_CHAT_IDS)) if REQUIRED_CHAT_IDS else "Tidak ada"),
-                            reply_markup=kb([[("🔙 Kembali","back:main")]]))
+    rows=[[('➕ Tambah Target','join:add')]]
+    if targets:
+        rows += [[('🗑️ Hapus Target','join:remove')],[('🔄 Aktif/Nonaktif','join:toggle')]]
+    rows += [[('🔙 Kembali','back:main')]]
+    await q.message.answer(text,reply_markup=kb(rows))
+
+@dp.callback_query(F.data=="join:add")
+async def join_add(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner": return
+    awaiting_join.add(uid)
+    await q.answer()
+    await q.message.answer(
+        "➕ TAMBAH MANDATORY JOIN\n\n"
+        "Kirim data dengan format:\n"
+        "CHAT_ID | NAMA | LINK_JOIN\n\n"
+        "Contoh:\n-1001234567890 | COWOK AI GROUP | https://t.me/namagrup\n\n"
+        "Bot harus bisa melihat member grup/channel tersebut. Untuk channel, bot perlu akses admin yang sesuai agar verifikasi member dapat berjalan.",
+        reply_markup=kb([[('🔙 Kembali','back:main')]])
+    )
+
+@dp.callback_query(F.data=="join:remove")
+async def join_remove(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner": return
+    targets=await get_join_targets()
+    if not targets:
+        await q.answer("Belum ada target.",show_alert=True); return
+    rows=[]
+    for r in targets:
+        rows.append([(f"🗑️ {r[2] or r[1]}",f"join:del:{r[1]}")])
+    rows.append([('🔙 Kembali','back:main')])
+    await q.answer()
+    await q.message.answer("🗑️ Pilih target yang ingin dihapus:",reply_markup=kb(rows))
+
+@dp.callback_query(F.data.startswith("join:del:"))
+async def join_delete(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner": return
+    cid=int(q.data.rsplit(':',1)[1])
+    async with db() as c:
+        await c.execute("DELETE FROM join_targets WHERE chat_id=?",(cid,))
+        await c.commit()
+    await log_action(uid,"mandatory_join_delete","ok",str(cid))
+    await q.answer("Target dihapus.")
+    await join_cb(q)
+
+@dp.callback_query(F.data=="join:toggle")
+async def join_toggle(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner": return
+    targets=await get_join_targets()
+    rows=[]
+    for r in targets:
+        label=f"{'🟢' if r[4] else '🔴'} {r[2] or r[1]}"
+        rows.append([(label,f"join:flip:{r[1]}")])
+    rows.append([('🔙 Kembali','back:main')])
+    await q.answer()
+    await q.message.answer("🔄 Aktif / Nonaktifkan target:",reply_markup=kb(rows))
+
+@dp.callback_query(F.data.startswith("join:flip:"))
+async def join_flip(q: CallbackQuery):
+    uid=q.from_user.id
+    if await role(uid) != "owner": return
+    cid=int(q.data.rsplit(':',1)[1])
+    async with db() as c:
+        await c.execute("UPDATE join_targets SET enabled=1-enabled WHERE chat_id=?",(cid,))
+        await c.commit()
+    await log_action(uid,"mandatory_join_toggle","ok",str(cid))
+    await q.answer("Status diperbarui.")
+    await join_cb(q)
+
+@dp.callback_query(F.data=="join:check")
+async def join_check(q: CallbackQuery):
+    uid=q.from_user.id
+    if await mandatory_join_ok(uid):
+        await q.answer("✅ Verifikasi berhasil!",show_alert=True)
+        await send_panel(uid,"🤖 COWOK AI\n\nAkses berhasil dibuka. Pilih menu:",uid,main_kb(uid,await role(uid)))
+    else:
+        await q.answer("❌ Kamu belum join semuanya.",show_alert=True)
+        await send_join_gate(uid)
+
+@dp.message(F.text)
+async def join_text(m: Message):
+    uid=m.from_user.id
+    if uid not in awaiting_join or uid != OWNER_ID:
+        return
+    raw=(m.text or '').strip()
+    parts=[x.strip() for x in raw.split('|')]
+    if len(parts) != 3:
+        await m.answer("❌ Format salah. Gunakan: CHAT_ID | NAMA | LINK_JOIN",reply_markup=kb([[('🔙 Kembali','back:main')]]))
+        return
+    try:
+        cid=int(parts[0])
+    except ValueError:
+        await m.answer("❌ CHAT_ID harus berupa angka, misalnya -1001234567890.")
+        return
+    title,link=parts[1],parts[2]
+    if not re.match(r"^https?://t\.me/",link):
+        await m.answer("❌ LINK_JOIN harus berupa link Telegram, misalnya https://t.me/namagrup")
+        return
+    try:
+        chat=await bot.get_chat(cid)
+        title=title or (chat.title or str(cid))
+    except Exception as e:
+        await m.answer("❌ Bot tidak dapat mengakses chat tersebut. Pastikan CHAT_ID benar dan bot sudah masuk ke grup/channel.")
+        await log_action(uid,"mandatory_join_add","error",str(e))
+        return
+    async with db() as c:
+        await c.execute("INSERT INTO join_targets(chat_id,title,invite_url,enabled,created_at) VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title,invite_url=excluded.invite_url,enabled=1",
+                        (cid,title,link,1,utcnow()))
+        await c.commit()
+    awaiting_join.discard(uid)
+    await log_action(uid,"mandatory_join_add","ok",str(cid))
+    await m.answer(f"✅ Mandatory Join ditambahkan: {title}",reply_markup=kb([[('📢 Mandatory Join','admin:join')],[('🔙 Kembali','back:main')]]))
 
 @dp.callback_query(F.data=="admin:poster")
 async def poster_admin(q: CallbackQuery):
